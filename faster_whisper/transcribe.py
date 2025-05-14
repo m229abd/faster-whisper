@@ -7,7 +7,7 @@ import zlib
 from dataclasses import asdict, dataclass
 from inspect import signature
 from math import ceil
-from typing import BinaryIO, Iterable, List, Optional, Tuple, Union
+from typing import BinaryIO, Iterable, List, Optional, Tuple, Union, Dict
 from warnings import warn
 
 import ctranslate2
@@ -96,6 +96,7 @@ class TranscriptionOptions:
     clip_timestamps: Union[str, List[float]]
     hallucination_silence_threshold: Optional[float]
     hotwords: Optional[str]
+    allowed_languages_for_multilingual: Optional[List[str]] = None # New field
 
 
 @dataclass
@@ -175,7 +176,7 @@ class BatchedInferencePipeline:
     def generate_segment_batched(
         self,
         features: np.ndarray,
-        tokenizer: Tokenizer,
+        tokenizer: Tokenizer, 
         options: TranscriptionOptions,
     ):
         batch_size = features.shape[0]
@@ -192,33 +193,58 @@ class BatchedInferencePipeline:
         )
 
         if options.max_new_tokens is not None:
-            max_length = len(prompt) + options.max_new_tokens
+            current_max_length = len(prompt) + options.max_new_tokens
         else:
-            max_length = self.model.max_length
+            current_max_length = self.model.max_length
 
-        if max_length > self.model.max_length:
-            raise ValueError(
-                f"The length of the prompt is {len(prompt)}, and the `max_new_tokens` "
-                f"{max_length - len(prompt)}. Thus, the combined length of the prompt "
-                f"and `max_new_tokens` is: {max_length}. This exceeds the "
-                f"`max_length` of the Whisper model: {self.model.max_length}. "
-                "You should either reduce the length of your prompt, or "
-                "reduce the value of `max_new_tokens`, "
-                f"so that their combined length is less that {self.model.max_length}."
+        if current_max_length > self.model.max_length:
+            self.model.logger.warning(
+                f"Requested max_length {current_max_length} (prompt {len(prompt)} + new {options.max_new_tokens or 'auto'}) "
+                f"exceeds model's absolute max_length {self.model.max_length}. "
+                f"Will be capped by the model or CTranslate2."
             )
+            current_max_length = min(current_max_length, self.model.max_length)
+
 
         encoder_output = self.model.encode(features)
         prompts = [prompt.copy() for _ in range(batch_size)]
 
         if options.multilingual:
-            language_tokens = [
-                tokenizer.tokenizer.token_to_id(segment_langs[0][0])
-                for segment_langs in self.model.model.detect_language(encoder_output)
-            ]
-            language_token_index = prompt.index(tokenizer.language)
+            all_segment_lang_probs_ct2_batch = self.model.model.detect_language(encoder_output)
+            new_language_token_ids_for_prompts = []
+            for segment_idx, ct2_segment_langs in enumerate(all_segment_lang_probs_ct2_batch):
+                parsed_segment_langs = [{'code': token_str[2:-2], 'prob': prob, 'token': token_str}
+                                        for token_str, prob in ct2_segment_langs if token_str[2:-2] in _LANGUAGE_CODES]
+                if not parsed_segment_langs:
+                    self.model.logger.warning(f"Segment {segment_idx}: No valid language codes from model.")
+                    new_language_token_ids_for_prompts.append(tokenizer.language)
+                    continue
+                best_lang_token_for_segment = parsed_segment_langs[0]['token']
+                if options.allowed_languages_for_multilingual:
+                    valid_allowed = [lang for lang in options.allowed_languages_for_multilingual if lang in _LANGUAGE_CODES]
+                    if valid_allowed:
+                        filtered_segment_langs = [lang_info for lang_info in parsed_segment_langs if lang_info['code'] in valid_allowed]
+                        if filtered_segment_langs:
+                            filtered_segment_langs.sort(key=lambda x: x['prob'], reverse=True)
+                            best_lang_token_for_segment = filtered_segment_langs[0]['token']
+                        else:
+                            forced_lang_code = valid_allowed[0]
+                            best_lang_token_for_segment = f"<|{forced_lang_code}|>"
+                            self.model.logger.debug(f"Segment {segment_idx}: No allowed lang detected. Forcing to '{forced_lang_code}'.")
+                new_language_token_ids_for_prompts.append(tokenizer.tokenizer.token_to_id(best_lang_token_for_segment))
+            
+            if tokenizer.language is not None:
+                try:
+                    language_token_index_in_prompt = prompt.index(tokenizer.language)
 
-            for i, language_token in enumerate(language_tokens):
-                prompts[i][language_token_index] = language_token
+                    for i, new_lang_token_id in enumerate(new_language_token_ids_for_prompts):
+                        if i < len(prompts): prompts[i][language_token_index_in_prompt] = new_lang_token_id
+                except ValueError:
+                    self.model.logger.warning("Global lang token not found in prompt for multilingual update.")
+            else:
+                 self.model.logger.warning("Tokenizer.language is None, cannot update per-segment lang in prompt.")
+
+        current_temperature = options.temperatures[0] if options.temperatures else 0.0
 
         results = self.model.model.generate(
             encoder_output,
@@ -226,12 +252,12 @@ class BatchedInferencePipeline:
             beam_size=options.beam_size,
             patience=options.patience,
             length_penalty=options.length_penalty,
-            max_length=max_length,
+            max_length=current_max_length,
             suppress_blank=options.suppress_blank,
             suppress_tokens=options.suppress_tokens,
             return_scores=True,
             return_no_speech_prob=True,
-            sampling_temperature=options.temperatures[0],
+            sampling_temperature=current_temperature,
             repetition_penalty=options.repetition_penalty,
             no_repeat_ngram_size=options.no_repeat_ngram_size,
         )
@@ -240,11 +266,14 @@ class BatchedInferencePipeline:
         for result in results:
             # return scores
             seq_len = len(result.sequences_ids[0])
-            cum_logprob = result.scores[0] * (seq_len**options.length_penalty)
+            lp = float(options.length_penalty) if options.length_penalty is not None else 1.0
+            avg_logprob = 0
+            if seq_len > 0 :
+                avg_logprob = result.scores[0] / (seq_len + 1) if seq_len > 0 else result.scores[0]
 
             output.append(
                 dict(
-                    avg_logprob=cum_logprob / (seq_len + 1),
+                    avg_logprob=avg_logprob,
                     no_speech_prob=result.no_speech_prob,
                     tokens=result.sequences_ids[0],
                 )
@@ -255,7 +284,7 @@ class BatchedInferencePipeline:
     def transcribe(
         self,
         audio: Union[str, BinaryIO, np.ndarray],
-        language: Optional[str] = None,
+        language: Optional[Union[str, List[str]]] = None,
         task: str = "transcribe",
         log_progress: bool = False,
         beam_size: int = 5,
@@ -291,7 +320,7 @@ class BatchedInferencePipeline:
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
         max_new_tokens: Optional[int] = None,
         chunk_length: Optional[int] = None,
-        clip_timestamps: Optional[List[dict]] = None,
+        clip_timestamps: Optional[List[Dict[str, int]]] = None,
         hallucination_silence_threshold: Optional[float] = None,
         batch_size: int = 8,
         hotwords: Optional[str] = None,
@@ -385,105 +414,172 @@ class BatchedInferencePipeline:
             multilingual = False
 
         if not isinstance(audio, np.ndarray):
-            audio = decode_audio(audio, sampling_rate=sampling_rate)
-        duration = audio.shape[0] / sampling_rate
-
+            audio_waveform = decode_audio(audio, sampling_rate=sampling_rate)
+        else:
+            audio_waveform = audio
+        
+        duration = audio_waveform.shape[0] / sampling_rate
         self.model.logger.info(
             "Processing audio with duration %s", format_timestamp(duration)
         )
 
-        chunk_length = chunk_length or self.model.feature_extractor.chunk_length
-        # if no segment split is provided, use vad_model and generate segments
-        if not clip_timestamps:
-            if vad_filter:
-                if vad_parameters is None:
-                    vad_parameters = VadOptions(
-                        max_speech_duration_s=chunk_length,
-                        min_silence_duration_ms=160,
-                    )
-                elif isinstance(vad_parameters, dict):
-                    if "max_speech_duration_s" in vad_parameters.keys():
-                        vad_parameters.pop("max_speech_duration_s")
+        all_language_probs_for_info = None
+        final_language_for_tokenizer = None
+        detected_language_probability = 0.0
 
-                    vad_parameters = VadOptions(
-                        **vad_parameters, max_speech_duration_s=chunk_length
-                    )
-
-                active_segments = get_speech_timestamps(audio, vad_parameters)
-                clip_timestamps = merge_segments(active_segments, vad_parameters)
-            # run the audio if it is less than 30 sec even without clip_timestamps
-            elif duration < chunk_length:
-                clip_timestamps = [{"start": 0, "end": audio.shape[0]}]
+        if isinstance(language, str):
+            if not self.model.model.is_multilingual and language != "en":
+                self.model.logger.warning("Model is English-only, using 'en'.")
+                final_language_for_tokenizer = "en"
+                detected_language_probability = 1.0
+            elif language not in self.model.supported_languages:
+                self.model.logger.warning(f"Language '{language}' not supported by model. Detecting.")
+                # Fall through to detection
             else:
-                raise RuntimeError(
-                    "No clip timestamps found. "
-                    "Set 'vad_filter' to True or provide 'clip_timestamps'."
+                final_language_for_tokenizer = language
+                detected_language_probability = 1.0
+        
+        if final_language_for_tokenizer is None: # Need to detect
+            if not self.model.model.is_multilingual:
+                final_language_for_tokenizer = "en"
+                detected_language_probability = 1.0
+                all_language_probs_for_info = [("en", 1.0)]
+                if isinstance(language, list) and language and "en" not in language:
+                     self.model.logger.warning(
+                        "Model is English-only, but 'en' is not in the "
+                        "provided language list for detection. Using 'en'."
+                    )
+            else:
+                allowed_langs_for_detection = language if isinstance(language, list) else None
+                (
+                    detected_code,
+                    prob,
+                    all_probs,
+                ) = self.model.detect_language(
+                    audio=audio_waveform,
+                    language_detection_segments=language_detection_segments,
+                    language_detection_threshold=language_detection_threshold,
+                    allowed_languages=allowed_langs_for_detection,
                 )
+                final_language_for_tokenizer = detected_code
+                detected_language_probability = prob
+                all_language_probs_for_info = all_probs
+                self.model.logger.info(
+                    "Detected language '%s' with probability %.2f (allowed: %s)",
+                    final_language_for_tokenizer,
+                    detected_language_probability,
+                    allowed_langs_for_detection or "all supported",
+                )
+        effective_chunk_length_sec = chunk_length if chunk_length is not None else self.model.feature_extractor.chunk_length
 
-        duration_after_vad = (
-            sum((segment["end"] - segment["start"]) for segment in clip_timestamps)
-            / sampling_rate
-        )
+        # Initialize VAD parameters for transcription chunking
+        actual_vad_parameters_for_chunking: Optional[VadOptions] = None
+        if vad_filter:
+            if vad_parameters is None:
+                actual_vad_parameters_for_chunking = VadOptions(
+                    max_speech_duration_s=effective_chunk_length_sec,
+                    min_silence_duration_ms=160,
+                )
+            elif isinstance(vad_parameters, dict):
+                _vad_params_dict = vad_parameters.copy()
+                if "max_speech_duration_s" in _vad_params_dict: 
+                    _vad_params_dict.pop("max_speech_duration_s")
+                actual_vad_parameters_for_chunking = VadOptions(
+                    **_vad_params_dict, 
+                    max_speech_duration_s=effective_chunk_length_sec
+                )
+            else:
+                actual_vad_parameters_for_chunking = vad_parameters
+                # Override max_speech_duration_s if it wasn't set to align with chunk_length
+                if actual_vad_parameters_for_chunking.max_speech_duration_s != effective_chunk_length_sec :
+                    self.model.logger.debug(
+                        f"Aligning VAD max_speech_duration_s to effective_chunk_length_sec: {effective_chunk_length_sec}s"
+                    )
+                    actual_vad_parameters_for_chunking.max_speech_duration_s = effective_chunk_length_sec
 
+
+        clip_timestamps_for_processing: Optional[List[Dict[str, int]]] = None
+
+        if not clip_timestamps: # User did not provide explicit clip_timestamps
+            if vad_filter and actual_vad_parameters_for_chunking is not None:
+                self.model.logger.info("Applying VAD to audio for chunking.")
+                active_speech_segments = get_speech_timestamps(
+                    audio_waveform, 
+                    actual_vad_parameters_for_chunking,
+                    sampling_rate=sampling_rate
+                )
+                clip_timestamps_for_processing = merge_segments(
+                    active_speech_segments, 
+                    actual_vad_parameters_for_chunking,
+                    sampling_rate=sampling_rate
+                )
+                if not clip_timestamps_for_processing:
+                    self.model.logger.info("VAD found no speech segments to process.")
+            elif duration < effective_chunk_length_sec :
+                self.model.logger.info(
+                    "Audio is shorter than effective chunk length, processing as a single segment."
+                )
+                clip_timestamps_for_processing = [{"start": 0, "end": audio_waveform.shape[0]}]
+            else:
+                self.model.logger.warning(
+                    "No VAD filter and no clip_timestamps provided for audio longer than chunk_length. "
+                    "Processing as a single segment if short, or this might lead to issues if very long."
+                )
+                raise RuntimeError(
+                    "For BatchedInferencePipeline with audio longer than chunk_length, "
+                    "either 'vad_filter' must be True or 'clip_timestamps' must be provided."
+                )
+        else:
+            self.model.logger.info("Using user-provided clip_timestamps for chunking.")
+            clip_timestamps_for_processing = clip_timestamps
+
+        if clip_timestamps_for_processing:
+            duration_after_vad = (
+                sum((segment["end"] - segment["start"]) for segment in clip_timestamps_for_processing) / sampling_rate
+            )
+        else:
+            duration_after_vad = 0.0
+        
         self.model.logger.info(
-            "VAD filter removed %s of audio",
+            "Effective audio duration after VAD/clipping: %s (removed %s)",
+            format_timestamp(duration_after_vad),
             format_timestamp(duration - duration_after_vad),
         )
 
-        audio_chunks, chunks_metadata = collect_chunks(audio, clip_timestamps)
-        features = (
-            [self.model.feature_extractor(chunk)[..., :-1] for chunk in audio_chunks]
-            if duration_after_vad
-            else []
-        )
+        audio_chunks_list: List[np.ndarray] = []
+        chunks_metadata: List[Dict[str, float]] = []
 
-        all_language_probs = None
-        # detecting the language if not provided
-        if language is None:
-            if not self.model.model.is_multilingual:
-                language = "en"
-                language_probability = 1
-            else:
-                (
-                    language,
-                    language_probability,
-                    all_language_probs,
-                ) = self.model.detect_language(
-                    features=np.concatenate(
-                        features
-                        + [
-                            np.full((self.model.model.n_mels, 1), -1.5, dtype="float32")
-                        ],
-                        axis=1,
-                    ),  # add a dummy feature to account for empty audio
-                    language_detection_segments=language_detection_segments,
-                    language_detection_threshold=language_detection_threshold,
-                )
+        if clip_timestamps_for_processing:
+            audio_chunks_list, chunks_metadata = collect_chunks(
+                audio_waveform, 
+                clip_timestamps_for_processing,
+                sampling_rate=sampling_rate
+            )
+ 
+        features_for_transcription_list: List[np.ndarray] = []
+        if audio_chunks_list:
+            for i, chunk_audio in enumerate(audio_chunks_list):
+                if chunk_audio.size == 0:
+                    self.model.logger.warning(f"Audio chunk {i} is empty, skipping feature extraction for it.")
+                    continue 
 
-                self.model.logger.info(
-                    "Detected language '%s' with probability %.2f",
-                    language,
-                    language_probability,
+                features_for_transcription_list.append(
+                    self.model.feature_extractor(chunk_audio)[..., :-1]
                 )
+        
+        features_for_transcription_np: np.ndarray
+        if features_for_transcription_list:
+            features_for_transcription_np = np.stack(
+                [pad_or_trim(feature) for feature in features_for_transcription_list]
+            )
         else:
-            if not self.model.model.is_multilingual and language != "en":
-                self.model.logger.warning(
-                    "The current model is English-only but the language parameter is set to '%s'; "
-                    "using 'en' instead." % language
-                )
-                language = "en"
-
-            language_probability = 1
+            features_for_transcription_np = np.array([])
 
         tokenizer = Tokenizer(
             self.model.hf_tokenizer,
             self.model.model.is_multilingual,
             task=task,
-            language=language,
-        )
-
-        features = (
-            np.stack([pad_or_trim(feature) for feature in features]) if features else []
+            language=final_language_for_tokenizer,
         )
 
         options = TranscriptionOptions(
@@ -496,6 +592,8 @@ class BatchedInferencePipeline:
             log_prob_threshold=log_prob_threshold,
             no_speech_threshold=no_speech_threshold,
             compression_ratio_threshold=compression_ratio_threshold,
+            condition_on_previous_text=False, 
+            prompt_reset_on_temperature=0.5, 
             temperatures=(
                 temperature[:1]
                 if isinstance(temperature, (list, tuple))
@@ -509,40 +607,42 @@ class BatchedInferencePipeline:
                 if suppress_tokens
                 else suppress_tokens
             ),
+            without_timestamps=without_timestamps,
+            max_initial_timestamp=0.0, 
+            word_timestamps=word_timestamps,
             prepend_punctuations=prepend_punctuations,
             append_punctuations=append_punctuations,
-            max_new_tokens=max_new_tokens,
-            hotwords=hotwords,
-            word_timestamps=word_timestamps,
-            hallucination_silence_threshold=None,
-            condition_on_previous_text=False,
-            clip_timestamps=clip_timestamps,
-            prompt_reset_on_temperature=0.5,
             multilingual=multilingual,
-            without_timestamps=without_timestamps,
-            max_initial_timestamp=0.0,
+            max_new_tokens=max_new_tokens,
+            clip_timestamps="0",
+            hallucination_silence_threshold=hallucination_silence_threshold,
+            hotwords=hotwords,
+            allowed_languages_for_multilingual=(
+                language if isinstance(language, list) and multilingual else None
+            ),
         )
 
         info = TranscriptionInfo(
-            language=language,
-            language_probability=language_probability,
+            language=final_language_for_tokenizer,
+            language_probability=detected_language_probability,
             duration=duration,
             duration_after_vad=duration_after_vad,
             transcription_options=options,
-            vad_options=vad_parameters,
-            all_language_probs=all_language_probs,
+            vad_options=actual_vad_parameters_for_chunking,
+            all_language_probs=all_language_probs_for_info,
         )
 
-        segments = self._batched_segments_generator(
-            features,
+        segments_iterable = self._batched_segments_generator(
+            features_for_transcription_np,
             tokenizer,
             chunks_metadata,
+            
             batch_size,
             options,
             log_progress,
         )
 
-        return segments, info
+        return segments_iterable, info
 
     def _batched_segments_generator(
         self, features, tokenizer, chunks_metadata, batch_size, options, log_progress
@@ -596,6 +696,7 @@ class WhisperModel:
         download_root: Optional[str] = None,
         local_files_only: bool = False,
         files: dict = None,
+        revision: Optional[str] = None,
         **model_kwargs,
     ):
         """Initializes the Whisper model.
@@ -627,6 +728,9 @@ class WhisperModel:
           files: Load model files from the memory. This argument is a dictionary mapping file names
             to file contents as file-like or bytes objects. If this is set, model_path acts as an
             identifier for this model.
+          revision:
+            An optional Git revision id which can be a branch name, a tag, or a
+            commit hash.
         """
         self.logger = get_logger()
 
@@ -705,7 +809,7 @@ class WhisperModel:
     def transcribe(
         self,
         audio: Union[str, BinaryIO, np.ndarray],
-        language: Optional[str] = None,
+        language: Optional[Union[str, List[str]]] = None,
         task: str = "transcribe",
         log_progress: bool = False,
         beam_size: int = 5,
@@ -825,37 +929,104 @@ class WhisperModel:
 
         if multilingual and not self.model.is_multilingual:
             self.logger.warning(
-                "The current model is English-only but the multilingual parameter is set to"
+                "The current model is English-only but the multilingual parameter is set to "
                 "True; setting to False instead."
             )
             multilingual = False
 
         if not isinstance(audio, np.ndarray):
-            audio = decode_audio(audio, sampling_rate=sampling_rate)
+            audio_waveform = decode_audio(audio, sampling_rate=sampling_rate)
+        else:
+            audio_waveform = audio
 
-        duration = audio.shape[0] / sampling_rate
-        duration_after_vad = duration
-
+        duration = audio_waveform.shape[0] / sampling_rate
         self.logger.info(
             "Processing audio with duration %s", format_timestamp(duration)
         )
 
-        if vad_filter and clip_timestamps == "0":
+        all_language_probs_for_info = None
+        final_language_for_tokenizer = None
+        detected_language_probability = 0.0
+
+        if isinstance(language, str):
+            if not self.model.is_multilingual and language != "en":
+                self.logger.warning("Model is English-only, language parameter set to '%s'. Using 'en'." % language)
+                final_language_for_tokenizer = "en"
+                detected_language_probability = 1.0
+            elif language not in self.supported_languages:
+                 self.logger.warning(f"Provided language '{language}' is not in the list of supported languages. Attempting detection.")
+                 # Fall through
+            else:
+                final_language_for_tokenizer = language
+                detected_language_probability = 1.0
+        
+        if final_language_for_tokenizer is None:
+            if not self.model.is_multilingual:
+                final_language_for_tokenizer = "en"
+                detected_language_probability = 1.0
+                all_language_probs_for_info = [("en", 1.0)]
+                if isinstance(language, list) and language and "en" not in language:
+                     self.logger.warning("Model is English-only, but 'en' is not in the provided language list for detection. Using 'en'.")
+            else:
+                allowed_langs_for_detection = language if isinstance(language, list) else None
+                (
+                    detected_code, prob, all_probs,
+                ) = self.detect_language(
+                    audio=audio_waveform,
+                    language_detection_segments=language_detection_segments,
+                    language_detection_threshold=language_detection_threshold,
+                    allowed_languages=allowed_langs_for_detection,
+                )
+                final_language_for_tokenizer = detected_code
+                detected_language_probability = prob
+                all_language_probs_for_info = all_probs
+                self.logger.info(
+                    "Detected language '%s' with probability %.2f (allowed: %s)",
+                    final_language_for_tokenizer, detected_language_probability, allowed_langs_for_detection or "all supported",
+                )
+        
+        duration_after_vad = duration
+        speech_chunks_for_timestamp_restoration: Optional[List[Dict[str, int]]] = None
+        vad_parameters_for_info: Optional[VadOptions] = None
+
+        if vad_filter and clip_timestamps == "0": # VAD is active and not overridden by explicit clips
             if vad_parameters is None:
-                vad_parameters = VadOptions()
+                vad_parameters_for_info = VadOptions()
             elif isinstance(vad_parameters, dict):
-                vad_parameters = VadOptions(**vad_parameters)
-            speech_chunks = get_speech_timestamps(audio, vad_parameters)
-            audio_chunks, chunks_metadata = collect_chunks(audio, speech_chunks)
-            audio = np.concatenate(audio_chunks, axis=0)
-            duration_after_vad = audio.shape[0] / sampling_rate
+                vad_parameters_for_info = VadOptions(**vad_parameters)
+            else:
+                vad_parameters_for_info = vad_parameters
+            
+            self.logger.info("Applying VAD to audio for WhisperModel.transcribe.")
+            speech_chunks_from_vad = get_speech_timestamps(
+                audio_waveform, 
+                vad_parameters_for_info, 
+                sampling_rate=sampling_rate
+            )
+            
+            if speech_chunks_from_vad:
+                audio_chunks_kept_by_vad, _ = collect_chunks(audio_waveform, speech_chunks_from_vad)
+                if audio_chunks_kept_by_vad and any(c.size > 0 for c in audio_chunks_kept_by_vad):
+                    audio_waveform_after_vad = np.concatenate(
+                        [c for c in audio_chunks_kept_by_vad if c.size > 0]
+                    )
+                    duration_after_vad = audio_waveform_after_vad.shape[0] / sampling_rate
+                    speech_chunks_for_timestamp_restoration = speech_chunks_from_vad
+                    audio_waveform = audio_waveform_after_vad 
+                else:
+                    self.logger.info("VAD filter removed all audio. No segments to transcribe.")
+                    audio_waveform = np.array([], dtype=np.float32)
+                    duration_after_vad = 0.0
+            else:
+                self.logger.info("VAD filter found no speech. No segments to transcribe.")
+                audio_waveform = np.array([], dtype=np.float32)
+                duration_after_vad = 0.0
 
             self.logger.info(
                 "VAD filter removed %s of audio",
                 format_timestamp(duration - duration_after_vad),
             )
-
-            if self.logger.isEnabledFor(logging.DEBUG):
+            if self.logger.isEnabledFor(logging.DEBUG) and speech_chunks_from_vad:
                 self.logger.debug(
                     "VAD filter kept the following audio segments: %s",
                     ", ".join(
@@ -864,65 +1035,20 @@ class WhisperModel:
                             format_timestamp(chunk["start"] / sampling_rate),
                             format_timestamp(chunk["end"] / sampling_rate),
                         )
-                        for chunk in speech_chunks
+                        for chunk in speech_chunks_from_vad
                     ),
                 )
 
+        if audio_waveform.size > 0:
+            features = self.feature_extractor(audio_waveform, chunk_length=chunk_length)
         else:
-            speech_chunks = None
-
-        features = self.feature_extractor(audio, chunk_length=chunk_length)
-
-        encoder_output = None
-        all_language_probs = None
-
-        # detecting the language if not provided
-        if language is None:
-            if not self.model.is_multilingual:
-                language = "en"
-                language_probability = 1
-            else:
-                start_timestamp = (
-                    float(clip_timestamps.split(",")[0])
-                    if isinstance(clip_timestamps, str)
-                    else clip_timestamps[0]
-                )
-                content_frames = features.shape[-1] - 1
-                seek = (
-                    int(start_timestamp * self.frames_per_second)
-                    if start_timestamp * self.frames_per_second < content_frames
-                    else 0
-                )
-                (
-                    language,
-                    language_probability,
-                    all_language_probs,
-                ) = self.detect_language(
-                    features=features[..., seek:],
-                    language_detection_segments=language_detection_segments,
-                    language_detection_threshold=language_detection_threshold,
-                )
-
-                self.logger.info(
-                    "Detected language '%s' with probability %.2f",
-                    language,
-                    language_probability,
-                )
-        else:
-            if not self.model.is_multilingual and language != "en":
-                self.logger.warning(
-                    "The current model is English-only but the language parameter is set to '%s'; "
-                    "using 'en' instead." % language
-                )
-                language = "en"
-
-            language_probability = 1
+            features = np.array([], dtype=np.float32).reshape(self.feature_extractor.n_mels, 0)
 
         tokenizer = Tokenizer(
             self.hf_tokenizer,
             self.model.is_multilingual,
             task=task,
-            language=language,
+            language=final_language_for_tokenizer,
         )
 
         options = TranscriptionOptions(
@@ -959,25 +1085,28 @@ class WhisperModel:
             hallucination_silence_threshold=hallucination_silence_threshold,
             hotwords=hotwords,
         )
-
-        segments = self.generate_segments(
-            features, tokenizer, options, log_progress, encoder_output
+        segments_iterable = self.generate_segments(
+            features, tokenizer, options, log_progress, encoder_output=None
         )
 
-        if speech_chunks:
-            segments = restore_speech_timestamps(segments, speech_chunks, sampling_rate)
+        if speech_chunks_for_timestamp_restoration:
+            segments_iterable = restore_speech_timestamps(
+                segments_iterable, 
+                speech_chunks_for_timestamp_restoration, 
+                sampling_rate
+            )
 
         info = TranscriptionInfo(
-            language=language,
-            language_probability=language_probability,
+            language=final_language_for_tokenizer,
+            language_probability=detected_language_probability,
             duration=duration,
             duration_after_vad=duration_after_vad,
             transcription_options=options,
-            vad_options=vad_parameters,
-            all_language_probs=all_language_probs,
+            vad_options=vad_parameters_for_info, # VAD options used for pre-filtering
+            all_language_probs=all_language_probs_for_info,
         )
 
-        return segments, info
+        return segments_iterable, info
 
     def _split_segments_by_timestamps(
         self,
@@ -1731,11 +1860,14 @@ class WhisperModel:
         vad_parameters: Union[dict, VadOptions] = None,
         language_detection_segments: int = 1,
         language_detection_threshold: float = 0.5,
+        allowed_languages: Optional[List[str]] = None,
     ) -> Tuple[str, float, List[Tuple[str, float]]]:
         """
         Use Whisper to detect the language of the input audio or features.
 
         Arguments:
+            allowed_languages: Optional list of language codes to restrict detection to.
+                               If None, all supported languages are considered.
             audio: Input audio signal, must be a 1D float array sampled at 16khz.
             features: Input Mel spectrogram features, must be a float array with
                 shape (n_mels, n_frames), if `audio` is provided, the features will be ignored.
@@ -1750,53 +1882,115 @@ class WhisperModel:
 
         Returns:
             language: Detected language.
-            languege_probability: Probability of the detected language.
-            all_language_probs: List of tuples with all language names and probabilities.
+            language_probability: Probability of the detected language.
+            all_language_probs: List of tuples with all language names and probabilities
+                                (filtered by allowed_languages if provided).
         """
         assert (
             audio is not None or features is not None
         ), "Either `audio` or `features` must be provided."
 
         if audio is not None:
+            current_vad_parameters = None
             if vad_filter:
-                speech_chunks = get_speech_timestamps(audio, vad_parameters)
-                audio_chunks, chunks_metadata = collect_chunks(audio, speech_chunks)
-                audio = np.concatenate(audio_chunks, axis=0)
+                if vad_parameters is None:
+                    current_vad_parameters = VadOptions()
+                elif isinstance(vad_parameters, dict):
+                    current_vad_parameters = VadOptions(**vad_parameters)
+                else:
+                    current_vad_parameters = vad_parameters
+                
+                speech_chunks = get_speech_timestamps(audio, current_vad_parameters)
+                if speech_chunks:
+                    audio_chunks, _ = collect_chunks(audio, speech_chunks)
+                    if audio_chunks and any(chunk.size > 0 for chunk in audio_chunks):
+                        audio = np.concatenate([chunk for chunk in audio_chunks if chunk.size > 0], axis=0)
+                    else:
+                        self.logger.warning("VAD removed all audio or found no speech for language detection.")
+                        audio = np.array([], dtype=np.float32)
+                else:
+                    self.logger.warning("VAD found no speech chunks for language detection.")
+                    audio = np.array([], dtype=np.float32)
 
-            audio = audio[
-                : language_detection_segments * self.feature_extractor.n_samples
-            ]
-            features = self.feature_extractor(audio)
 
-        features = features[
-            ..., : language_detection_segments * self.feature_extractor.nb_max_frames
-        ]
+            if audio.size == 0:
+                self.logger.warning("Audio for language detection is empty.")
+                fallback_lang = (allowed_languages[0] if allowed_languages and allowed_languages[0] in _LANGUAGE_CODES
+                                 else "en")
+                return fallback_lang, 0.0, [(fallback_lang, 0.0)]
 
-        detected_language_info = {}
-        for i in range(0, features.shape[-1], self.feature_extractor.nb_max_frames):
-            encoder_output = self.encode(
-                pad_or_trim(features[..., i : i + self.feature_extractor.nb_max_frames])
-            )
-            # results is a list of tuple[str, float] with language names and probabilities.
-            results = self.model.detect_language(encoder_output)[0]
+            audio_slice_len = language_detection_segments * self.feature_extractor.n_samples
+            features = self.feature_extractor(audio[:audio_slice_len])
+        
+        if features is None or features.shape[-1] == 0:
+            self.logger.warning("Features for language detection are empty or invalid.")
+            fallback_lang = (allowed_languages[0] if allowed_languages and allowed_languages[0] in _LANGUAGE_CODES
+                             else "en")
+            return fallback_lang, 0.0, [(fallback_lang, 0.0)]
+        
+        features_for_detection = pad_or_trim(
+            features[..., :self.feature_extractor.nb_max_frames]
+        )
+        if features_for_detection.shape[-1] == 0:
+            self.logger.warning("Padded/trimmed features for language detection are empty.")
+            fallback_lang = (allowed_languages[0] if allowed_languages and allowed_languages[0] in _LANGUAGE_CODES
+                             else "en")
+            return fallback_lang, 0.0, [(fallback_lang, 0.0)]
 
-            # Parse language names to strip out markers
-            all_language_probs = [(token[2:-2], prob) for (token, prob) in results]
-            # Get top language token and probability
-            language, language_probability = all_language_probs[0]
-            if language_probability > language_detection_threshold:
-                break
-            detected_language_info.setdefault(language, []).append(language_probability)
-        else:
-            # If no language detected for all segments, the majority vote of the highest
-            # projected languages for all segments is used to determine the language.
-            language = max(
-                detected_language_info,
-                key=lambda lang: len(detected_language_info[lang]),
-            )
-            language_probability = max(detected_language_info[language])
 
-        return language, language_probability, all_language_probs
+        encoder_output = self.encode(features_for_detection)
+        
+        # ct2_results: e.g., [("<|en|>", 0.9), ("<|fr|>", 0.1)]
+        ct2_results = self.model.detect_language(encoder_output)[0]
+        
+        # raw_model_probs: e.g., [("en", 0.9), ("fr", 0.1)], ensuring lang codes are valid
+        raw_model_probs = []
+        for token, prob in ct2_results:
+            lang_code = token[2:-2]
+            if lang_code in _LANGUAGE_CODES: # Validate against known codes
+                raw_model_probs.append((lang_code, prob))
+
+        if not raw_model_probs:
+            self.logger.warning("Language detection model returned no recognizable language codes.")
+            fallback_lang = (allowed_languages[0] if allowed_languages and allowed_languages[0] in _LANGUAGE_CODES
+                             else _LANGUAGE_CODES[0]) # Default to first known if no allowed list
+            return fallback_lang, 0.0, [(fallback_lang, 0.0)]
+
+        if allowed_languages:
+            valid_allowed_languages = [lang for lang in allowed_languages if lang in _LANGUAGE_CODES]
+            if not valid_allowed_languages:
+                self.logger.warning(
+                    "Provided 'allowed_languages' list is empty or contains no valid codes. "
+                    "Detecting from all supported languages."
+                )
+                # Fall through to non-restricted detection by not modifying raw_model_probs further here
+            else:
+                filtered_probs = []
+                for lang_code, prob in raw_model_probs:
+                    if lang_code in valid_allowed_languages:
+                        filtered_probs.append((lang_code, prob))
+                
+                if not filtered_probs:
+                    self.logger.warning(
+                        f"None of the model's top detected languages are in the allowed list {valid_allowed_languages}. "
+                        f"Model detected (top 3): {raw_model_probs[:3]}. "
+                        f"Falling back to the first allowed language '{valid_allowed_languages[0]}'."
+                    )
+                    final_lang = valid_allowed_languages[0]
+                    final_prob = 0.0  # No confidence from model for this forced choice
+                    all_returned_probs = [(final_lang, final_prob)]
+                else:
+                    # Sort by probability and pick the best among allowed
+                    filtered_probs.sort(key=lambda x: x[1], reverse=True)
+                    final_lang, final_prob = filtered_probs[0]
+                    all_returned_probs = filtered_probs # Return the filtered list
+                
+                return final_lang, final_prob, all_returned_probs
+
+        # If no allowed_languages or if valid_allowed_languages was effectively empty
+        final_lang, final_prob = raw_model_probs[0]
+        all_returned_probs = raw_model_probs
+        return final_lang, final_prob, all_returned_probs
 
 
 def restore_speech_timestamps(
